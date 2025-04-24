@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-// add more errors
+// add more errors to process in handlers
 var (
 	ErrURLNotFound = errors.New("url not fount")
 	ErrURLExists = errors.New("url exists")
@@ -14,6 +14,10 @@ var (
 
 type Storage struct {
 	db *sql.DB 
+}
+
+func (s *Storage) GetDB() *sql.DB {
+    return s.db
 }
 
 func New(DSN string) (*Storage, error){

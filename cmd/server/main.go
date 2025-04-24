@@ -5,6 +5,7 @@ import (
 	"os"
 	"url-sentinel/internal/config"
 	"url-sentinel/internal/storage"
+
 	_ "github.com/lib/pq"
 )
 
@@ -22,15 +23,15 @@ func main() {
 	log.Info("starting url-sentinel", slog.String("env", cfg.Env))
 	log.Debug("debug messages are enabled")
 
-	// TODO: init storage: PostgreSQL
-
 	db, err := storage.New(cfg.Database.DSN)
 	if err != nil {
 		log.Error("failed to open db", "error", err)
 		os.Exit(1)
 	}
+
 	_ = db // delete
-    log.Info("connected to database")
+
+	log.Info("connected to database")
 
 	// TODO: init router: chi
 
