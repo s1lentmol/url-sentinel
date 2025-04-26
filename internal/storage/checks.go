@@ -28,7 +28,7 @@ func (r *CheckRepository) SaveCheck(c *model.Check) error {
 	if err != nil {
 		return fmt.Errorf("%s, %w", op, err)
 	}
-	_, err = stmt.Exec(query,
+	_, err = stmt.Exec(
 		c.ID,
 		c.URLID,
 		c.Status,
@@ -55,7 +55,7 @@ func (r *CheckRepository) ListOfChecksByURL(urlID uuid.UUID) ([]model.Check, err
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	
-	rows, err := stmt.Query()
+	rows, err := stmt.Query(urlID)
 	if err != nil {
 		return nil, err
 	}
