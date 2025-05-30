@@ -2,20 +2,19 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
-	"net/http"
 	"syscall"
+
 	"url-sentinel/internal/config"
-	"url-sentinel/internal/http-server/handlers/url/delete"
-	"url-sentinel/internal/http-server/handlers/url/get"
-	"url-sentinel/internal/http-server/handlers/url/history"
-	"url-sentinel/internal/http-server/handlers/url/list"
-	"url-sentinel/internal/http-server/handlers/url/save"
-	mwLogger "url-sentinel/internal/http-server/middleware/logger"
+	"url-sentinel/internal/delivery/http/handler"
+	mw "url-sentinel/internal/delivery/http/middleware"
 	"url-sentinel/internal/monitor"
-	"url-sentinel/internal/storage"
+	"url-sentinel/internal/repository/postgres"
+	"url-sentinel/internal/usecase"
 
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
@@ -29,69 +28,149 @@ const (
 )
 
 func main() {
+	// Load configuration
 	cfg := config.MustLoad()
 
-	log := setupLogger(cfg.Env)
+	// Setup logger
+	logger := setupLogger(cfg.Env)
+	logger.Info("starting url-sentinel",
+		slog.String("env", cfg.Env),
+		slog.String("address", cfg.HTTPServer.Address),
+	)
 
-	log.Info("starting url-sentinel", slog.String("env", cfg.Env))
-	log.Debug("debug messages are enabled")
-
-	db, err := storage.New(cfg.Database.DSN)
+	// Initialize database
+	db, err := postgres.New(cfg.Database.DSN())
 	if err != nil {
-		log.Error("failed to open db", "error", err)
+		logger.Error("failed to connect to database", slog.Any("error", err))
 		os.Exit(1)
 	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			logger.Error("failed to close database", slog.Any("error", err))
+		}
+	}()
+	logger.Info("database connected successfully")
 
-	// initialize repositories
-	urlRepo := storage.NewURLRepository(db.GetDB())
-	checkRepo := storage.NewCheckRepository(db.GetDB())
+	// Initialize repositories
+	urlRepo := postgres.NewURLRepository(db.DB)
+	checkRepo := postgres.NewCheckRepository(db.DB)
 
-	// Start background monitor
+	// Initialize and start monitor
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	mon := monitor.NewMonitor(urlRepo, checkRepo, log)
-	go mon.Start(ctx)
 
-	// Listen for shutdown signals
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	mon := monitor.NewMonitor(urlRepo, checkRepo, logger)
+	if err := mon.Start(ctx); err != nil {
+		logger.Error("failed to start monitor", slog.Any("error", err))
+	}
+
+	// Initialize use cases with monitor for dynamic URL management
+	urlUseCase := usecase.NewURLUseCase(urlRepo, mon)
+	checkUseCase := usecase.NewCheckUseCase(checkRepo)
+
+	// Initialize handlers
+	urlHandler := handler.NewURLHandler(urlUseCase, logger)
+	checkHandler := handler.NewCheckHandler(checkUseCase, logger)
+
+	// Setup router
+	router := setupRouter(urlHandler, checkHandler, logger)
+
+	// Setup HTTP server
+	server := &http.Server{
+		Addr:         cfg.HTTPServer.Address,
+		Handler:      router,
+		ReadTimeout:  cfg.HTTPServer.ReadTimeout,
+		WriteTimeout: cfg.HTTPServer.WriteTimeout,
+		IdleTimeout:  cfg.HTTPServer.IdleTimeout,
+	}
+
+	// Start server in a goroutine
+	serverErrors := make(chan error, 1)
 	go func() {
-		<-stop
-		log.Info("shutdown signal received")
-		cancel()
+		logger.Info("server listening", slog.String("address", cfg.HTTPServer.Address))
+		serverErrors <- server.ListenAndServe()
 	}()
 
-	router := chi.NewRouter()
+	// Wait for interrupt signal or server error
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
 
-	router.Use(middleware.RequestID)
-	router.Use(middleware.Logger)
-	router.Use(mwLogger.New(log))
-	router.Use(middleware.Recoverer)
-	router.Use(middleware.URLFormat)
-	router.Use(middleware.StripSlashes)
-
-	router.Route("/urls", func(router chi.Router) {
-		router.Post("/", save.Handler(urlRepo, log))
-		router.Get("/", list.Handler(urlRepo, log))
-		router.Get("/{id}", get.Handler(urlRepo, log))
-		router.Delete("/{id}", delete.Handler(urlRepo, log))
-		router.Get("/{id}/history", history.Handler(checkRepo, log))
-	})
-	log.Info("listening on address", slog.String("addr", cfg.HTTPServer.Address))
-	if err := http.ListenAndServe(cfg.HTTPServer.Address, router); err != nil {
-		log.Error("server error", slog.Any("error", err))
+	select {
+	case err := <-serverErrors:
+		logger.Error("server error", slog.Any("error", err))
 		os.Exit(1)
+
+	case sig := <-shutdown:
+		logger.Info("shutdown signal received", slog.String("signal", sig.String()))
+
+		// Stop monitor
+		mon.Stop()
+
+		// Graceful shutdown with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.HTTPServer.ShutdownTimeout)
+		defer cancel()
+
+		if err := server.Shutdown(ctx); err != nil {
+			logger.Error("failed to shutdown server gracefully", slog.Any("error", err))
+			if err := server.Close(); err != nil {
+				logger.Error("failed to close server", slog.Any("error", err))
+			}
+			os.Exit(1)
+		}
+
+		logger.Info("server stopped gracefully")
 	}
 }
 
+func setupRouter(
+	urlHandler *handler.URLHandler,
+	checkHandler *handler.CheckHandler,
+	logger *slog.Logger,
+) *chi.Mux {
+	router := chi.NewRouter()
+
+	// Middleware
+	router.Use(middleware.RequestID)
+	router.Use(middleware.RealIP)
+	router.Use(mw.Logger(logger))
+	router.Use(middleware.Recoverer)
+	router.Use(middleware.URLFormat)
+
+	// Health check endpoint
+	router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
+	})
+
+	// URL routes
+	router.Route("/urls", func(r chi.Router) {
+		r.Post("/", urlHandler.Create)
+		r.Get("/", urlHandler.List)
+		r.Get("/{id}", urlHandler.Get)
+		r.Delete("/{id}", urlHandler.Delete)
+		r.Get("/{id}/history", checkHandler.GetHistory)
+	})
+
+	return router
+}
+
 func setupLogger(env string) *slog.Logger {
-	var log *slog.Logger
-	// can add different environmen
+	var handler slog.Handler
+
 	switch env {
-	case envLocal:
-		log = slog.New(
-			slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}),
-		)
+	case envLocal, envDev:
+		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		})
+	case envProd:
+		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})
+	default:
+		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})
 	}
-	return log
+
+	return slog.New(handler)
 }
